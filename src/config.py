@@ -14,10 +14,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # Streamlit secrets fallback (for cloud deployment)
 try:
     import streamlit as st
-    if hasattr(st, 'secrets'):
-        DATA_GOV_API_KEY = st.secrets.get("DATA_GOV_API_KEY", DATA_GOV_API_KEY)
-        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", GEMINI_API_KEY)
-except:
+    if hasattr(st, 'secrets') and len(st.secrets) > 0:
+        # Streamlit Cloud - use secrets
+        if "DATA_GOV_API_KEY" in st.secrets:
+            DATA_GOV_API_KEY = st.secrets["DATA_GOV_API_KEY"]
+        if "GEMINI_API_KEY" in st.secrets:
+            GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except Exception as e:
+    # Not in Streamlit context or secrets not configured
     pass
 
 # Database Configuration
