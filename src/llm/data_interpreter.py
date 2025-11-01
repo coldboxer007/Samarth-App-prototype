@@ -5,8 +5,13 @@ from typing import List, Dict, Any, Optional
 import logging
 import google.generativeai as genai
 import json
+import os
 
 from src.config import GEMINI_API_KEY
+
+# Disable Google Cloud default credentials to prevent metadata service errors on Streamlit Cloud
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = ''
+os.environ['NO_GCE_CHECK'] = 'True'
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +33,8 @@ class DataInterpreter:
     }
 
     def __init__(self, api_key: str = GEMINI_API_KEY):
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is required. Please add it to Streamlit secrets or .env file")
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.0-flash-lite')
 
