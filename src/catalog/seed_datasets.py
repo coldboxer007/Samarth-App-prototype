@@ -6,6 +6,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Authorized publishers - only fetch data from these trusted sources
+AUTHORIZED_PUBLISHERS = [
+    "India Meteorological Department",
+    "Ministry of Agriculture & Farmers Welfare",
+    "Ministry of Agriculture and Farmers Welfare",  # Alternative spelling
+    "IMD",  # Abbreviation
+]
+
 
 @dataclass
 class SeedDataset:
@@ -106,3 +114,30 @@ def get_seed_count() -> dict:
         "climate": climate_count,
         "agriculture": agriculture_count
     }
+
+
+def is_authorized_publisher(publisher: str) -> bool:
+    """
+    Check if a publisher is in the authorized list.
+
+    Args:
+        publisher: Publisher name to check
+
+    Returns:
+        True if publisher is authorized, False otherwise
+    """
+    if not publisher:
+        return False
+
+    publisher_lower = publisher.lower().strip()
+
+    for authorized in AUTHORIZED_PUBLISHERS:
+        if authorized.lower() in publisher_lower or publisher_lower in authorized.lower():
+            return True
+
+    return False
+
+
+def get_authorized_publishers() -> List[str]:
+    """Get list of authorized publishers."""
+    return AUTHORIZED_PUBLISHERS.copy()

@@ -7,6 +7,7 @@ import google.generativeai as genai
 
 from src.config import DATA_GOV_API_KEY, GEMINI_API_KEY
 from src.catalog.dataset_catalog import DatasetCatalog, DatasetMetadata
+from src.catalog.seed_datasets import is_authorized_publisher, get_authorized_publishers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ class DatasetDiscovery:
         self.catalog = DatasetCatalog()
         genai.configure(api_key=GEMINI_API_KEY)
         self.llm = genai.GenerativeModel('gemini-2.0-flash-lite')
+
+        # Authorized publishers
+        self.authorized_publishers = get_authorized_publishers()
+        logger.info(f"Authorized publishers: {', '.join(self.authorized_publishers)}")
 
         # Search terms for different categories
         self.search_terms = {
@@ -146,7 +151,7 @@ Category:"""
 
             logger.info(f"Found {len(unique_datasets)} unique datasets for {category}")
 
-            # Convert to DatasetMetadata
+            # Convert to DatasetMetadata (filtering by authorized publishers happens inside)
             for dataset in unique_datasets[:10]:  # Limit to top 10 per category
                 metadata = self._convert_to_metadata(dataset, category)
                 if metadata:
@@ -154,7 +159,7 @@ Category:"""
                     # Add to catalog
                     self.catalog.add_dataset(metadata)
 
-            logger.info(f"Added {len(discovered[category])} {category} datasets to catalog")
+            logger.info(f"Added {len(discovered[category])} {category} datasets from authorized publishers to catalog")
 
         return discovered
 
@@ -186,6 +191,11 @@ Category:"""
                 dataset.get("org", {}).get("title") if isinstance(dataset.get("org"), dict)
                 else dataset.get("source", "data.gov.in")
             )
+
+            # FILTER: Only allow authorized publishers
+            if not is_authorized_publisher(publisher):
+                logger.info(f"Skipping dataset '{title}' from unauthorized publisher: {publisher}")
+                return None
 
             # Create unique, descriptive name
             # If title is very generic (single word), append publisher
@@ -264,8 +274,10 @@ Category:"""
 
         logger.info(f"Found {len(unique_datasets)} unique datasets from search")
 
-        # Step 3: Add new datasets to catalog (skip if already present)
+        # Step 3: Add new datasets to catalog (skip if already present or unauthorized)
         newly_added = []
+        skipped_unauthorized = 0
+
         for dataset in unique_datasets:
             resource_id = self._extract_resource_id(dataset)
 
@@ -273,6 +285,17 @@ Category:"""
             existing = self.catalog.get_dataset(resource_id)
             if existing:
                 logger.info(f"Dataset {resource_id} already in catalog, skipping")
+                continue
+
+            # Check publisher BEFORE calling LLM (save API calls)
+            publisher = (
+                dataset.get("org", {}).get("title") if isinstance(dataset.get("org"), dict)
+                else dataset.get("source", "data.gov.in")
+            )
+
+            if not is_authorized_publisher(publisher):
+                skipped_unauthorized += 1
+                logger.debug(f"Skipping dataset {resource_id} from unauthorized publisher: {publisher}")
                 continue
 
             # Determine category using LLM
@@ -288,7 +311,9 @@ Category:"""
                 newly_added.append(metadata)
                 logger.info(f"Added new dataset: {metadata.name} ({resource_id})")
 
-        logger.info(f"Added {len(newly_added)} new datasets to catalog")
+        logger.info(f"Added {len(newly_added)} new datasets from authorized publishers to catalog")
+        if skipped_unauthorized > 0:
+            logger.info(f"Skipped {skipped_unauthorized} datasets from unauthorized publishers")
 
         # Step 4: Return all relevant datasets (both existing and new)
         return self.get_relevant_datasets(question)

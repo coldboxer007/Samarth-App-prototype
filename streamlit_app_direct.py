@@ -39,6 +39,10 @@ with st.sidebar:
     - ✅ 100% dataset loading (no transformation failures)
     - ✅ LLM handles messy data intelligently
     - ✅ More flexible than rigid schemas
+
+    **Trusted Data Sources:**
+    - India Meteorological Department (IMD)
+    - Ministry of Agriculture & Farmers Welfare
     """)
 
     st.divider()
