@@ -5,7 +5,8 @@
       "Bash(python scripts/verify_setup.py:*)",
       "Bash(pip install:*)",
       "Bash(python3:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(python scripts/test_enhanced_discovery.py:*)"
     ],
     "deny": [],
     "ask": []

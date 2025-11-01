@@ -1,13 +1,16 @@
 """Automatic dataset discovery from data.gov.in."""
 
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
 import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 from src.config import DATA_GOV_API_KEY, GEMINI_API_KEY
 from src.catalog.dataset_catalog import DatasetCatalog, DatasetMetadata
 from src.catalog.seed_datasets import is_authorized_publisher, get_authorized_publishers
+from src.catalog.keyword_expander import KeywordExpander
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +29,13 @@ class DatasetDiscovery:
         self.authorized_publishers = get_authorized_publishers()
         logger.info(f"Authorized publishers: {', '.join(self.authorized_publishers)}")
 
+        # Keyword expander for generating search variations
+        self.keyword_expander = KeywordExpander()
+
+        # Search cache to avoid redundant API calls
+        self.search_cache: Dict[str, List[Dict]] = {}
+        self.cache_ttl = 3600  # Cache for 1 hour
+
         # Search terms for different categories
         self.search_terms = {
             "climate": [
@@ -38,17 +48,24 @@ class DatasetDiscovery:
             ]
         }
 
-    def search_datasets(self, query: str, max_results: int = 10) -> List[Dict]:
+    def search_datasets(self, query: str, max_results: int = 10, use_cache: bool = True) -> List[Dict]:
         """
-        Search for datasets on data.gov.in.
+        Search for datasets on data.gov.in with caching support.
 
         Args:
             query: Search query
             max_results: Maximum number of results to return
+            use_cache: Whether to use cached results
 
         Returns:
             List of dataset metadata
         """
+        # Check cache first
+        cache_key = f"{query}_{max_results}"
+        if use_cache and cache_key in self.search_cache:
+            logger.info(f"Using cached results for: {query}")
+            return self.search_cache[cache_key]
+
         try:
             # data.gov.in search API endpoint - using /lists which works for catalog search
             search_url = "https://api.data.gov.in/lists"
@@ -65,13 +82,20 @@ class DatasetDiscovery:
 
             if response.status_code == 200:
                 data = response.json()
+                results = []
                 if "records" in data:
-                    return data["records"]
+                    results = data["records"]
                 elif "result" in data and "records" in data["result"]:
-                    return data["result"]["records"]
+                    results = data["result"]["records"]
                 else:
                     logger.warning(f"Unexpected response structure from data.gov.in")
-                    return []
+                    results = []
+
+                # Cache the results
+                if use_cache:
+                    self.search_cache[cache_key] = results
+
+                return results
             else:
                 logger.error(f"Search failed with status {response.status_code}")
                 return []
@@ -79,6 +103,56 @@ class DatasetDiscovery:
         except Exception as e:
             logger.error(f"Error searching datasets: {e}")
             return []
+
+    def search_datasets_parallel(
+        self,
+        queries: List[str],
+        max_results_per_query: int = 10,
+        max_workers: int = 5
+    ) -> List[Dict]:
+        """
+        Search for datasets using multiple queries in parallel.
+
+        Args:
+            queries: List of search queries
+            max_results_per_query: Maximum results per query
+            max_workers: Number of parallel workers
+
+        Returns:
+            Deduplicated list of all discovered datasets
+        """
+        logger.info(f"Starting parallel search with {len(queries)} queries using {max_workers} workers")
+
+        all_datasets = []
+        seen_ids = set()
+
+        # Use ThreadPoolExecutor for parallel API calls
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all search tasks
+            future_to_query = {
+                executor.submit(self.search_datasets, query, max_results_per_query): query
+                for query in queries
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_query):
+                query = future_to_query[future]
+                try:
+                    datasets = future.result()
+                    logger.info(f"Query '{query}' returned {len(datasets)} datasets")
+
+                    # Add unique datasets
+                    for ds in datasets:
+                        resource_id = self._extract_resource_id(ds)
+                        if resource_id and resource_id not in seen_ids:
+                            seen_ids.add(resource_id)
+                            all_datasets.append(ds)
+
+                except Exception as e:
+                    logger.error(f"Error processing query '{query}': {e}")
+
+        logger.info(f"Parallel search completed. Found {len(all_datasets)} unique datasets from {len(queries)} queries")
+        return all_datasets
 
     def categorize_dataset(self, dataset: Dict) -> Optional[str]:
         """
@@ -235,48 +309,77 @@ Category:"""
             logger.error(f"Error converting dataset to metadata: {e}")
             return None
 
-    def discover_and_add_datasets_for_question(self, question: str) -> List[Dict]:
+    def discover_and_add_datasets_for_question(
+        self,
+        question: str,
+        max_combinations: int = 20,
+        max_workers: int = 5
+    ) -> List[str]:
         """
         Discover and add new datasets on-demand based on the user's question.
 
+        ENHANCED VERSION with:
+        - Keyword expansion (synonyms, variations)
+        - Parallel searching for speed
+        - Relevance scoring and ranking
+
         This method:
         1. Extracts search keywords from the question using LLM
-        2. Searches data.gov.in for relevant datasets
-        3. Adds new datasets to the catalog if not already present
-        4. Returns the list of relevant dataset IDs (both existing and newly added)
+        2. Expands keywords with synonyms and creates combinations
+        3. Searches data.gov.in in parallel using multiple keyword combinations
+        4. Ranks datasets by relevance
+        5. Adds new datasets to the catalog if not already present
+        6. Returns the list of relevant dataset IDs (both existing and newly added)
 
         Args:
             question: User's natural language question
+            max_combinations: Maximum number of keyword combinations to try
+            max_workers: Number of parallel search workers
 
         Returns:
-            List of dataset metadata dictionaries
+            List of relevant dataset resource IDs
         """
         logger.info(f"Discovering datasets for question: {question}")
 
         # Step 1: Extract search keywords from the question using LLM
         keywords = self._extract_search_keywords(question)
-        logger.info(f"Extracted keywords: {keywords}")
+        logger.info(f"Extracted base keywords: {keywords}")
 
-        # Step 2: Search for datasets using these keywords
-        discovered_datasets = []
-        for keyword in keywords:
-            datasets = self.search_datasets(keyword, max_results=5)
-            discovered_datasets.extend(datasets)
+        # Step 2: Expand keywords with synonyms and generate combinations
+        search_queries = self.keyword_expander.generate_keyword_combinations(
+            keywords=keywords,
+            max_combinations=max_combinations,
+            include_single=True,
+            include_pairs=True,
+            expand_keywords=True
+        )
+        logger.info(f"Generated {len(search_queries)} search query combinations")
 
-        # Remove duplicates
-        seen = set()
-        unique_datasets = []
-        for ds in discovered_datasets:
-            resource_id = self._extract_resource_id(ds)
-            if resource_id and resource_id not in seen:
-                seen.add(resource_id)
-                unique_datasets.append(ds)
+        # Step 3: Search for datasets in parallel using all query combinations
+        discovered_datasets = self.search_datasets_parallel(
+            queries=search_queries,
+            max_results_per_query=5,
+            max_workers=max_workers
+        )
 
-        logger.info(f"Found {len(unique_datasets)} unique datasets from search")
+        logger.info(f"Found {len(discovered_datasets)} unique datasets from parallel search")
 
-        # Step 3: Add new datasets to catalog (skip if already present or unauthorized)
+        # Step 4: Rank datasets by relevance to original keywords
+        if discovered_datasets:
+            ranked_datasets = self.keyword_expander.rank_datasets(
+                datasets=discovered_datasets,
+                keywords=keywords
+            )
+            # Sort by relevance score (already sorted by rank_datasets)
+            unique_datasets = [ds for ds, score in ranked_datasets if score > 0]
+            logger.info(f"Ranked datasets. Top 5 scores: {[score for _, score in ranked_datasets[:5]]}")
+        else:
+            unique_datasets = []
+
+        # Step 5: Add new datasets to catalog (skip if already present or unauthorized)
         newly_added = []
         skipped_unauthorized = 0
+        dataset_ids_for_question = []
 
         for dataset in unique_datasets:
             resource_id = self._extract_resource_id(dataset)
@@ -284,7 +387,8 @@ Category:"""
             # Check if dataset already exists in catalog
             existing = self.catalog.get_dataset(resource_id)
             if existing:
-                logger.info(f"Dataset {resource_id} already in catalog, skipping")
+                logger.info(f"Dataset {resource_id} already in catalog")
+                dataset_ids_for_question.append(resource_id)
                 continue
 
             # Check publisher BEFORE calling LLM (save API calls)
@@ -309,14 +413,16 @@ Category:"""
             if metadata:
                 self.catalog.add_dataset(metadata)
                 newly_added.append(metadata)
+                dataset_ids_for_question.append(resource_id)
                 logger.info(f"Added new dataset: {metadata.name} ({resource_id})")
 
         logger.info(f"Added {len(newly_added)} new datasets from authorized publishers to catalog")
         if skipped_unauthorized > 0:
             logger.info(f"Skipped {skipped_unauthorized} datasets from unauthorized publishers")
 
-        # Step 4: Return all relevant datasets (both existing and new)
-        return self.get_relevant_datasets(question)
+        # Step 6: Return all relevant dataset IDs (both existing and newly added)
+        logger.info(f"Returning {len(dataset_ids_for_question)} relevant datasets for the question")
+        return dataset_ids_for_question
 
     def _extract_search_keywords(self, question: str) -> List[str]:
         """
